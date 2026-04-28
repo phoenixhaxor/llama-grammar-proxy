@@ -1,0 +1,25 @@
+[package]
+name = "llama_grammar_proxy"
+version = "1.0.0"
+edition = "2021"
+description = "Lightweight reverse proxy for llama-server with auto GBNF grammar injection"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tower-http = { version = "0.6", features = ["cors"] }
+http-body-util = "0.1"
+bytes = "1"
+hyper = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
