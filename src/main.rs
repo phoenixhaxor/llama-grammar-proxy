@@ -86,7 +86,7 @@ async fn main() {
     let state = AppState {
         backend_url: format!("http://{}:{}", args.backend_host, args.backend_port),
         client: Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(900))
             .build()
             .expect("Failed to build HTTP client"),
         grammar_content,
