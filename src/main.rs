@@ -35,7 +35,7 @@ struct Args {
     backend_host: String,
     #[arg(long, default_value_t = 8082)]
     backend_port: u16,
-    #[arg(long, default_value = "/Users/andre/llama-server-config/grammars/advanced.gbnf")]
+    #[arg(long, default_value = "/Users/andre/models/grammars/advanced.gbnf")]
     grammar: Option<String>,
     #[arg(long)]
     no_grammar: bool,
