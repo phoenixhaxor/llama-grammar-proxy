@@ -1,10 +1,13 @@
 //! llama-grammar-proxy — Ultra-lightweight reverse proxy for llama-server
 //!
 //! Auto-injects GBNF grammar into every /v1/chat/completions request.
+//! Smart comment stripping for code blocks to reduce token usage.
 //! Handles tool calling gracefully (skips grammar when tools present).
 //!
 //! Architecture:
 //!   Client → :8081 (this proxy) → :8082 (llama-server)
+
+mod filter;
 
 use axum::{
     body::Body,
@@ -39,6 +42,9 @@ struct Args {
     grammar: Option<String>,
     #[arg(long)]
     no_grammar: bool,
+    /// Disable smart comment filtering
+    #[arg(long)]
+    no_filter: bool,
     #[arg(short, long)]
     verbose: bool,
 }
@@ -50,6 +56,7 @@ struct AppState {
     backend_url: String,
     client: Client,
     grammar_content: Option<Arc<String>>,
+    filter_enabled: bool,
     verbose: bool,
 }
 
@@ -83,6 +90,8 @@ async fn main() {
         }
     };
 
+    let filter_enabled = !args.no_filter;
+
     let state = AppState {
         backend_url: format!("http://{}:{}", args.backend_host, args.backend_port),
         client: Client::builder()
@@ -90,6 +99,7 @@ async fn main() {
             .build()
             .expect("Failed to build HTTP client"),
         grammar_content,
+        filter_enabled,
         verbose: args.verbose,
     };
 
@@ -112,6 +122,10 @@ async fn main() {
             None => "DISABLED".into(),
         }
     );
+    println!(
+        "  Filter:     {}",
+        if filter_enabled { "ENABLED (smart comment strip)" } else { "DISABLED" }
+    );
     println!();
 
     if state.grammar_content.is_some() {
@@ -119,6 +133,11 @@ async fn main() {
         println!("  ✓ Tool calling aware — skips grammar when 'tools' field present");
     } else {
         println!("  ⚠ Passthrough mode (no grammar)");
+    }
+
+    if filter_enabled {
+        println!("  ✓ Smart filter — strips comments in code blocks (```...```)");
+        println!("  ✓ Safe: keeps TODO/FIXME/HACK, 'why' comments, long explanations");
     }
 
     println!("\n  Press Ctrl+C to stop\n");
@@ -154,39 +173,81 @@ async fn proxy_handler(
         format!("{}{}?{}", state.backend_url, path, query)
     };
 
-    // ── Grammar Injection ──
+    // ── Process request body ──
     let mut body_bytes = body;
     let mut injected = false;
+    let mut filter_stats = None;
 
     if method == Method::POST
         && path.contains("/chat/completions")
         && !body_bytes.is_empty()
-        && state.grammar_content.is_some()
     {
         if let Ok(body_str) = std::str::from_utf8(&body_bytes) {
             if let Ok(mut data) = serde_json::from_str::<Value>(body_str) {
+                let original_size = body_bytes.len();
+
+                // Step 1: Smart comment filter (before grammar injection)
+                if state.filter_enabled {
+                    if let Some(messages) = data.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                        let mut total_saved = 0usize;
+                        let mut total_stripped = 0usize;
+
+                        for msg in messages.iter_mut() {
+                            if let Some(content_val) = msg.get_mut("content") {
+                                if let Some(content_str) = content_val.as_str() {
+                                    let result = filter::filter_message(content_str);
+                                    total_saved += result.chars_saved;
+                                    total_stripped += result.comments_stripped;
+                                    *content_val = Value::String(result.filtered_content);
+                                }
+                            }
+                        }
+
+                        if total_saved > 0 {
+                            filter_stats = Some((total_stripped, total_saved));
+                        }
+                    }
+                }
+
+                // Step 2: Grammar injection (after filtering)
                 let has_grammar = data.get("grammar").is_some();
                 let has_tools = data.get("tools").is_some();
 
-                if !has_grammar && !has_tools {
+                if !has_grammar && !has_tools && state.grammar_content.is_some() {
                     if let Some(obj) = data.as_object_mut() {
                         obj.insert(
                             "grammar".to_string(),
                             Value::String(state.grammar_content.as_ref().unwrap().as_str().to_string()),
                         );
                     }
-                    match serde_json::to_vec(&data) {
-                        Ok(new_body) => {
-                            body_bytes = Bytes::from(new_body);
-                            injected = true;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to serialize injected body");
-                        }
-                    }
+                    injected = true;
                 } else if has_tools {
                     let count: usize = data["tools"].as_array().map(|a| a.len()).unwrap_or(0);
                     info!(tool_count = count, "Skipping grammar — tools present (tool calling mode)");
+                }
+
+                match serde_json::to_vec(&data) {
+                    Ok(new_body) => {
+                        let new_size = new_body.len();
+                        body_bytes = Bytes::from(new_body);
+
+                        // Log both filter and grammar stats
+                        if let Some((stripped, saved)) = filter_stats {
+                            info!(
+                                filter_saved_chars = saved,
+                                filter_stripped = stripped,
+                                body_before = original_size,
+                                body_after = new_size,
+                                grammar = if injected { "injected" } else { "skipped" },
+                                "✓ Request processed"
+                            );
+                        } else if injected {
+                            info!(body_size = new_size, "✓ Grammar injected");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to serialize body — using original");
+                    }
                 }
             }
         }
@@ -234,11 +295,11 @@ async fn proxy_handler(
                 }
             };
 
-            if injected {
-                info!(req_size = resp_body_bytes.len(), resp_len = resp_body_bytes.len(), %path, "✓ Grammar injected");
+            if injected && filter_stats.is_none() {
+                info!(resp_size = resp_body_bytes.len(), %path, "✓ Grammar injected");
             }
 
-            // Build final response — use axum's body conversion
+            // Build final response
             let final_resp: std::result::Result<axum::http::Response<Body>, axum::http::Error> =
                 resp_builder.body(Body::from(resp_body_bytes));
             match final_resp {
