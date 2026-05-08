@@ -3,9 +3,10 @@
 //! Auto-injects GBNF grammar into every /v1/chat/completions request.
 //! Smart comment stripping for code blocks to reduce token usage.
 //! Handles tool calling gracefully (skips grammar when tools present).
+//! Multi-backend switching via /admin/switch endpoint.
 //!
 //! Architecture:
-//!   Client → :8081 (this proxy) → :8082 (llama-server)
+//!   Client → :8081 (this proxy) → :8082 or :8083 (llama-server backends)
 
 mod filter;
 
@@ -15,13 +16,15 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
-    Router,
+    Json, Router,
 };
 use bytes::Bytes;
 use clap::Parser;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -30,14 +33,18 @@ use tracing::{error, info, warn};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "llama-grammar-proxy", version)]
-#[command(about = "Lightweight proxy for llama-server with auto GBNF grammar injection")]
+#[command(about = "Lightweight proxy for llama-server with auto GBNF grammar injection and multi-backend switching")]
 struct Args {
     #[arg(short, long, default_value_t = 8081)]
     port: u16,
     #[arg(long, default_value = "127.0.0.1")]
     backend_host: String,
+    /// Primary backend port (default, e.g. 8082)
     #[arg(long, default_value_t = 8082)]
     backend_port: u16,
+    /// Secondary backend port (switchable via /admin/switch, e.g. 8083)
+    #[arg(long)]
+    secondary_backend_port: Option<u16>,
     #[arg(long, default_value = "/Users/andre/models/grammars/advanced.gbnf")]
     grammar: Option<String>,
     #[arg(long)]
@@ -49,15 +56,50 @@ struct Args {
     verbose: bool,
 }
 
+// ── Switch Request (admin API) ─────────────────────────────
+
+#[derive(Deserialize)]
+struct SwitchRequest {
+    /// "primary" or "secondary" (or port number as string)
+    backend: String,
+}
+
+#[derive(Serialize)]
+struct SwitchResponse {
+    active_port: u16,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    listen_port: u16,
+    active_backend: String,
+    active_port: u16,
+    primary_port: u16,
+    secondary_port: Option<u16>,
+    grammar_enabled: bool,
+    filter_enabled: bool,
+}
+
 // ── App State ─────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
-    backend_url: String,
+    backend_host: String,
+    primary_port: u16,
+    secondary_port: Option<u16>,
+    active_port: Arc<AtomicU16>,
     client: Client,
     grammar_content: Option<Arc<String>>,
     filter_enabled: bool,
     verbose: bool,
+}
+
+impl AppState {
+    fn get_backend_url(&self) -> String {
+        let port = self.active_port.load(Ordering::Relaxed);
+        format!("http://{}:{}", self.backend_host, port)
+    }
 }
 
 // ── Main ───────────────────────────────────────────────────
@@ -91,9 +133,14 @@ async fn main() {
     };
 
     let filter_enabled = !args.no_filter;
+    let primary_port = args.backend_port;
+    let secondary_port = args.secondary_backend_port;
 
     let state = AppState {
-        backend_url: format!("http://{}:{}", args.backend_host, args.backend_port),
+        backend_host: args.backend_host.clone(),
+        primary_port,
+        secondary_port,
+        active_port: Arc::new(AtomicU16::new(primary_port)),
         client: Client::builder()
             .timeout(std::time::Duration::from_secs(900))
             .build()
@@ -108,13 +155,24 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new().fallback(any(proxy_handler).with_state(state.clone())).layer(cors);
+    let app = Router::new()
+        // Admin endpoints
+        .route("/admin/switch", axum::routing::post(switch_backend))
+        .route("/admin/status", axum::routing::get(get_status))
+        // All other requests go to proxy
+        .fallback(any(proxy_handler))
+        .with_state(state.clone())
+        .layer(cors);
+
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
 
     println!();
     println!("═══ llama-grammar-proxy (Rust) ═══");
     println!("  Listen:     0.0.0.0:{}", args.port);
-    println!("  Backend:    {}:{}", args.backend_host, args.backend_port);
+    println!("  Primary:    {}:{}", args.backend_host, primary_port);
+    if let Some(sec) = secondary_port {
+        println!("  Secondary:  {}:{}", args.backend_host, sec);
+    }
     println!(
         "  Grammar:    {}",
         match &state.grammar_content {
@@ -126,6 +184,10 @@ async fn main() {
         "  Filter:     {}",
         if filter_enabled { "ENABLED (smart comment strip)" } else { "DISABLED" }
     );
+    println!();
+    println!("  Admin endpoints:");
+    println!("    POST /admin/switch  {{\"backend\": \"primary\"|\"secondary\"|\"8083\"}}");
+    println!("    GET  /admin/status");
     println!();
 
     if state.grammar_content.is_some() {
@@ -156,6 +218,84 @@ async fn shutdown_signal() {
     info!("Shutting down...");
 }
 
+// ── Admin Handlers ─────────────────────────────────────────
+
+async fn switch_backend(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchRequest>,
+) -> Response {
+    let new_port = match req.backend.to_lowercase().as_str() {
+        "primary" | "p" | "1" => {
+            info!("Switching to PRIMARY backend (port {})", state.primary_port);
+            state.primary_port
+        }
+        "secondary" | "sec" | "s" | "2" => {
+            match state.secondary_port {
+                Some(port) => {
+                    info!("Switching to SECONDARY backend (port {})", port);
+                    port
+                }
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(SwitchResponse {
+                            active_port: state.active_port.load(Ordering::Relaxed),
+                            message: "No secondary backend configured".into(),
+                        }),
+                    ).into_response();
+                }
+            }
+        }
+        // Allow direct port number
+        other => {
+            if let Ok(port) = other.parse::<u16>() {
+                info!("Switching to backend port {}", port);
+                port
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SwitchResponse {
+                        active_port: state.active_port.load(Ordering::Relaxed),
+                        message: format!("Invalid backend: '{}'. Use 'primary', 'secondary', or port number.", other),
+                    }),
+                ).into_response();
+            }
+        }
+    };
+
+    let old_port = state.active_port.swap(new_port, Ordering::Relaxed);
+    info!("Backend switched: {} → {}", old_port, new_port);
+
+    (
+        StatusCode::OK,
+        Json(SwitchResponse {
+            active_port: new_port,
+            message: format!("Switched from port {} to {}", old_port, new_port),
+        }),
+    ).into_response()
+}
+
+async fn get_status(State(state): State<AppState>) -> Response {
+    let active = state.active_port.load(Ordering::Relaxed);
+    let label = if active == state.primary_port {
+        "primary"
+    } else if Some(active) == state.secondary_port {
+        "secondary"
+    } else {
+        "custom"
+    };
+
+    Json(StatusResponse {
+        listen_port: 8081, // We don't store this in state, but it's always 8081 for now
+        active_backend: label.to_string(),
+        active_port: active,
+        primary_port: state.primary_port,
+        secondary_port: state.secondary_port,
+        grammar_enabled: state.grammar_content.is_some(),
+        filter_enabled: state.filter_enabled,
+    }).into_response()
+}
+
 // ── Proxy Handler ───────────────────────────────────────────
 
 async fn proxy_handler(
@@ -167,10 +307,14 @@ async fn proxy_handler(
 ) -> Response {
     let path = uri.path();
     let query = uri.query().unwrap_or("");
+
+    // Get current backend URL (may have been switched)
+    let backend_url = state.get_backend_url();
+
     let backend_path = if query.is_empty() {
-        format!("{}{}", state.backend_url, path)
+        format!("{}{}", backend_url, path)
     } else {
-        format!("{}{}?{}", state.backend_url, path, query)
+        format!("{}{}?{}", backend_url, path, query)
     };
 
     // ── Process request body ──
